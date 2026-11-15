@@ -5,11 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetCompactionCoverageNoteForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { nativeInterceptInstalled, _resetForTest as _resetFetchInterceptForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { nativeWebSocketInterceptInstalled, _resetForTest as _resetWsInterceptForTest } from "../src/agent/native-ws-intercept.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
-import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
+import { isDshCompactionActive, _resetDshCompactionVerdictForTest, _resetDshCompactionGateTelemetryForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
 import { startServer } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
@@ -1237,6 +1237,50 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
         _resetRegisterForTest(undefined);
         _resetWebProfileWarningForTest();
         _resetNonWebTraceForTest();
+    }
+});
+
+test("#6770 the #3962 coverage readout exits on the first routed request, once per process", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-6770-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-6770-"));
+    const logFile = path.join(stateHome, "billion-context", "bili.log");
+    const coverageLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "")
+        .split("\n")
+        .filter((l) => l.includes("[dsh-client]") && l.includes("compaction overlay coverage"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetDshCompactionGateTelemetryForTest();
+            _resetCompactionCoverageNoteForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            // the readout is a first-REQUEST exit — apply alone must not emit it
+            _resetDshCompactionGateTelemetryForTest();
+            assert.equal(coverageLines().length, 0, "no coverage line before the first routed request");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            // first routed request (the host's own agent chain) → the readout goes out
+            ctx.setInitiator({ session: { id: "s6770" } });
+            assert.equal(gate("https://api.anthropic.com/v1/messages"), true);
+            const lines = coverageLines();
+            assert.equal(lines.length, 1, `expected exactly one coverage line, got: ${lines.join(" | ")}`);
+            // hermetic DSH_HOME: no preset config resolved in this process → the
+            // honest lazy-resolution frame, byte-identical to the shared formatter
+            assert.match(lines[0]!, /bili-native-dsh: compaction overlay coverage — no preset entry rewritten in this process \(preset configs resolve lazily — zero at this point does not mean zero later\) \(#6770\)$/);
+            // once per process: a later routed request adds nothing
+            assert.equal(gate("https://api.anthropic.com/v1/messages"), true);
+            assert.equal(coverageLines().length, 1, "second routed request must not re-emit the readout");
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetDshCompactionGateTelemetryForTest();
+        _resetCompactionCoverageNoteForTest();
     }
 });
 
